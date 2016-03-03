@@ -6,6 +6,7 @@ use strict;
 use CGI;
 use JSON;
 use LWP::UserAgent;
+use Net::DNS;
 
 # =============================================================================
 
@@ -18,12 +19,16 @@ my $CONFIG = {
 	'ack_ttl' => 0, # Time in seconds the acknowledgement in Icinga last before
 	                # it times out automatically. 0 means the acknowledgement
 	                # never expires. If you're using Nagios this MUST be 0.
+	#
+	# PagerDuty Webhook source, for validation of the incoming connection
+	# https://support.pagerduty.com/hc/en-us/articles/204923760
+	'webhook_hostname' => 'webhooks.pagerduty.com'
 };
 
 # =============================================================================
 
 sub ackHost {
-	my ($time, $host, $comment, $author, $sticky, $notify, $persistent) = @_;
+	my ($time, $host, $author, $comment, $sticky, $notify, $persistent) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -68,7 +73,7 @@ sub deackHost {
 # =============================================================================
 
 sub ackService {
-	my ($time, $host, $service, $comment, $author, $sticky, $notify, $persistent) = @_;
+	my ($time, $host, $service, $author, $comment, $sticky, $notify, $persistent) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -117,6 +122,33 @@ my ($TIME, $QUERY, $POST, $JSON);
 
 $TIME = time ();
 
+my $REMOTE_ADDR = "";
+if ( exists $ENV{'REMOTE_ADDR'} ) {
+	if ( $ENV{'REMOTE_ADDR'} =~ m/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/ ) {
+		$REMOTE_ADDR = $1 ;
+	}
+}
+
+if ( $REMOTE_ADDR ) {	# If we didn't get any value at all, we'll still try processing the POST.
+	my $foundIt = 0 ;
+	my $res   = Net::DNS::Resolver->new ;
+	my $reply = $res->search( $CONFIG->{'webhook_hostname'} ) ;
+	if ( $reply ) {
+		foreach my $rr ( $reply->answer ) {
+			next unless $rr->type eq "A" ;
+			if ( $rr->address eq $REMOTE_ADDR ) {
+				$foundIt = 1 ;
+				last ;
+			}
+		}
+	}
+	if ( $foundIt != 1 ) {
+		print "Status: 403 Request from unauthorized IP address $REMOTE_ADDR\n\n403 Request from unauthorized IP address $REMOTE_ADDR\n" ;
+		exit( 0 ) ;
+	}
+}
+
+
 $QUERY = CGI->new ();
 
 if (! defined ($POST = $QUERY->param ('POSTDATA'))) {
@@ -141,7 +173,9 @@ $return = {
 };
 
 MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
-	my ($hostservice, $status, $error);
+	my ($hostservice, $status, $error, $last_status_change_by, $assigned_to_user, $last_status_change_on, $html_url);
+	my $author = 'PagerDuty - no specific author data available' ;
+	my $comment = 'Acknowledged by PagerDuty - no specific comment data available' ;
 
 	if ((ref ($message) ne 'HASH') || ! defined ($message->{'type'})) {
 		next MESSAGE;
@@ -154,11 +188,29 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 	}
 
 	if ($message->{'type'} eq 'incident.acknowledge') {
-                if ($hostservice->{'SERVICEDESC'} eq "") {
-			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, 'Acknowledged by PagerDuty', 'PagerDuty', 2, 0, 0);
+
+		if ( defined( $last_status_change_by = $message->{'data'}->{'incident'}->{'last_status_change_by'} ) ) {
+			$author = "<a href='" . $last_status_change_by->{ 'html_url' } . "' target='_new'>" . $last_status_change_by->{ 'name' } . "</a> " . $last_status_change_by->{ 'email' } ;
+		}
+
+		if ( defined( $last_status_change_on = $message->{'data'}->{'incident'}->{'last_status_change_on'} ) ) {
+			$last_status_change_on .= " " ;
+		} else {
+			$last_status_change_on = "" ;
+		}
+
+		if ( defined( $html_url = $message->{'data'}->{'incident'}->{'html_url'} ) ) {
+			$comment = "Acknowledged via PagerDuty: " . $last_status_change_on . "<a href='" . $html_url . "' target='_new'>" . $html_url . "</a>" ;
+		}
+		if ( defined( $assigned_to_user = $message->{'data'}->{'incident'}->{'assigned_to_user'} ) ) {
+			$comment .= " currently assigned to <a href='" . $assigned_to_user->{ 'html_url' } . "' target='_new'>" . $assigned_to_user->{ 'name' } . "</a> " . $assigned_to_user->{ 'email' } ;
+		}
+
+		if ($hostservice->{'SERVICEDESC'} eq "") {
+			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, $author, $comment, 2, 0, 0);
 
 		} else {
-			($status, $error) = ackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 'Acknowledged by PagerDuty', 'PagerDuty', 2, 0, 0);
+			($status, $error) = ackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, $author, $comment, 2, 0, 0);
 		}
 
 		$return->{'messages'}{$message->{'id'}} = {
@@ -166,7 +218,7 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 			'message' => ($error ? $error : undef)
 		};
 
-	} elsif ($message->{'type'} eq 'incident.unacknowledge') {
+	} elsif ($message->{'type'} eq 'incident.unacknowledge' || $message->{'type'} eq 'incident.assign' || $message->{'type'} eq 'incident.escalate' ) {
 		if (! defined ($hostservice->{'SERVICEDESC'})) {
 			($status, $error) = deackHost ($TIME, $hostservice->{'HOSTNAME'});
 

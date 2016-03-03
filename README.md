@@ -16,6 +16,10 @@ Contributors
 * David Nguyen (d_k_nguyen@yahoo.com, http://github.com/deeno35)
   * Icinga support ([PR #1](https://github.com/jeffwalter/pd-nag-connector/pull/1))
   * Icinga ACK timeout support ([PR #2](https://github.com/jeffwalter/pd-nag-connector/pull/2))
+* Stefan Wuensch (https://github.com/stefan-wuensch)
+  * Validate incoming connection with DNS lookup
+  * Dynamic Ack `Author` and `Comment` with links to person and incident in PD
+  * De-Ack also on change of assignment, or escalation
 
 Copyright and License
 ---------------------
