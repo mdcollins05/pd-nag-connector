@@ -53,7 +53,7 @@ sub ackHost {
 # =============================================================================
 
 sub deackHost {
-	my ($time, $host) = @_;
+	my ($time, $host, $persistent, $author, $comment) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -62,6 +62,7 @@ sub deackHost {
 	}
 
 	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_HOST_COMMENT;%s;%u;%s;%s\n", $time, $host, $persistent, $author, $comment);
 	printf (NAGIOS "[%u] REMOVE_HOST_ACKNOWLEDGEMENT;%s\n", $time, $host);
 	# Close the file handle
 	close (NAGIOS);
@@ -99,7 +100,7 @@ sub ackService {
 # =============================================================================
 
 sub deackService {
-	my ($time, $host, $service) = @_;
+	my ($time, $host, $service, $persistent, $author, $comment) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -108,7 +109,48 @@ sub deackService {
 	}
 
 	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_SVC_COMMENT;%s;%s;%u;%s;%s\n", $time, $host, $service, $persistent, $author, $comment);
 	printf (NAGIOS "[%u] REMOVE_SVC_ACKNOWLEDGEMENT;%s;%s\n", $time, $host, $service);
+	# Close the file handle
+	close (NAGIOS);
+
+	# Return with happiness
+	return (1, undef);
+}
+
+# =============================================================================
+
+sub commentHost {
+	my ($time, $host, $persistent, $author, $comment) = @_;
+
+	# Open the external commands file
+	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
+		# Well shizzle
+		return (undef, $!);
+	}
+
+	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_HOST_COMMENT;%s;%u;%s;%s\n", $time, $host, $persistent, $author, $comment);
+	# Close the file handle
+	close (NAGIOS);
+
+	# Return with happiness
+	return (1, undef);
+}
+
+# =============================================================================
+
+sub commentService {
+	my ($time, $host, $service, $persistent, $author, $comment) = @_;
+
+	# Open the external commands file
+	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
+		# Well shizzle
+		return (undef, $!);
+	}
+
+	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_SVC_COMMENT;%s;%s;%u;%s;%s\n", $time, $host, $service, $persistent, $author, $comment);
 	# Close the file handle
 	close (NAGIOS);
 
@@ -187,24 +229,24 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 		next MESSAGE;
 	}
 
+	if ( defined( $last_status_change_by = $message->{'data'}->{'incident'}->{'last_status_change_by'} ) ) {
+		$author = "<a href='" . $last_status_change_by->{ 'html_url' } . "' target='_new' >" . $last_status_change_by->{ 'name' } . "</a> " . $last_status_change_by->{ 'email' } ;
+	}
+
+	if ( defined( $last_status_change_on = $message->{'data'}->{'incident'}->{'last_status_change_on'} ) ) {
+		$last_status_change_on .= " " ;		# If we got the date, add a space to delimit what's coming up next
+	} else {
+		$last_status_change_on = "" ;		# If there's no date, init to null so we can add on
+	}
+
+	if ( defined( $html_url = $message->{'data'}->{'incident'}->{'html_url'} ) ) {
+		$comment = "Acknowledged via PagerDuty: " . $last_status_change_on . "<a href='" . $html_url . "' target='_new' >" . $html_url . " </a>" ;
+	}
+	if ( defined( $assigned_to_user = $message->{'data'}->{'incident'}->{'assigned_to_user'} ) ) {
+		$comment .= " currently assigned to <a href='" . $assigned_to_user->{ 'html_url' } . "' target='_new' >" . $assigned_to_user->{ 'name' } . "</a> " . $assigned_to_user->{ 'email' } ;
+	}
+
 	if ($message->{'type'} eq 'incident.acknowledge') {
-
-		if ( defined( $last_status_change_by = $message->{'data'}->{'incident'}->{'last_status_change_by'} ) ) {
-			$author = "<a href='" . $last_status_change_by->{ 'html_url' } . "' target='_new'>" . $last_status_change_by->{ 'name' } . "</a> " . $last_status_change_by->{ 'email' } ;
-		}
-
-		if ( defined( $last_status_change_on = $message->{'data'}->{'incident'}->{'last_status_change_on'} ) ) {
-			$last_status_change_on .= " " ;
-		} else {
-			$last_status_change_on = "" ;
-		}
-
-		if ( defined( $html_url = $message->{'data'}->{'incident'}->{'html_url'} ) ) {
-			$comment = "Acknowledged via PagerDuty: " . $last_status_change_on . "<a href='" . $html_url . "' target='_new'>" . $html_url . "</a>" ;
-		}
-		if ( defined( $assigned_to_user = $message->{'data'}->{'incident'}->{'assigned_to_user'} ) ) {
-			$comment .= " currently assigned to <a href='" . $assigned_to_user->{ 'html_url' } . "' target='_new'>" . $assigned_to_user->{ 'name' } . "</a> " . $assigned_to_user->{ 'email' } ;
-		}
 
 		if ($hostservice->{'SERVICEDESC'} eq "") {
 			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, $author, $comment, 2, 0, 0);
@@ -219,11 +261,48 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 		};
 
 	} elsif ($message->{'type'} eq 'incident.unacknowledge' || $message->{'type'} eq 'incident.assign' || $message->{'type'} eq 'incident.escalate' ) {
+
+		$comment =~ s/Acknowledged/Acknowledgement removed/ ;
+		
 		if (! defined ($hostservice->{'SERVICEDESC'})) {
-			($status, $error) = deackHost ($TIME, $hostservice->{'HOSTNAME'});
+			($status, $error) = deackHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
 
 		} else {
-			($status, $error) = deackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'});
+			($status, $error) = deackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 0, $author, $comment );
+		}
+
+		$return->{'messages'}->{$message->{'id'}} = {
+			'status' => ($status ? 'okay' : 'fail'),
+			'message' => ($error ? $error : undef)
+		};
+		$return->{'status'} = ($status eq 'okay' ? $return->{'status'} : 'fail');
+
+	} elsif ($message->{'type'} eq 'incident.resolve' ) {
+
+		$comment =~ s/Acknowledged/Resolved/ ;
+
+		if (! defined ($hostservice->{'SERVICEDESC'})) {
+			($status, $error) = commentHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
+
+		} else {
+			($status, $error) = commentService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 0, $author, $comment);
+		}
+
+		$return->{'messages'}->{$message->{'id'}} = {
+			'status' => ($status ? 'okay' : 'fail'),
+			'message' => ($error ? $error : undef)
+		};
+		$return->{'status'} = ($status eq 'okay' ? $return->{'status'} : 'fail');
+
+	} elsif ($message->{'type'} eq 'incident.trigger' ) {
+
+		$comment =~ s/Acknowledged via/Received by/ ;
+
+		if (! defined ($hostservice->{'SERVICEDESC'})) {
+			($status, $error) = commentHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
+
+		} else {
+			($status, $error) = commentService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 0, $author, $comment);
 		}
 
 		$return->{'messages'}->{$message->{'id'}} = {
