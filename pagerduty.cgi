@@ -215,9 +215,9 @@ $return = {
 };
 
 MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
-	my ($hostservice, $status, $error, $last_status_change_by, $assigned_to_user, $last_status_change_on, $html_url);
-	my $author = 'PagerDuty - no specific author data available' ;
-	my $comment = 'Acknowledged by PagerDuty - no specific comment data available' ;
+	my ($hostservice, $status, $error, $last_status_change_by, $pd_service, $assigned_to_user, $last_status_change_on, $html_url_incident );
+	my $author = 'PagerDuty System' ;
+	my $comment = 'Acknowledged via PagerDuty - no specific comment data available' ;
 
 	if ((ref ($message) ne 'HASH') || ! defined ($message->{'type'})) {
 		next MESSAGE;
@@ -229,18 +229,23 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 		next MESSAGE;
 	}
 
+	# If we get a "last changed by" object or a "service" object, use it to customize the Author
 	if ( defined( $last_status_change_by = $message->{'data'}->{'incident'}->{'last_status_change_by'} ) ) {
 		$author = "<a href='" . $last_status_change_by->{ 'html_url' } . "' target='_new' >" . $last_status_change_by->{ 'name' } . "</a> " . $last_status_change_by->{ 'email' } ;
+	} elsif ( defined( $pd_service = $message->{'data'}->{'incident'}->{'service'} ) ) {
+		$author = "<a href='" . $pd_service->{ 'html_url' } . "' target='_new' >" . $pd_service->{ 'name' } . "</a> " ;
 	}
 
+	# Did we get a last changed date?
 	if ( defined( $last_status_change_on = $message->{'data'}->{'incident'}->{'last_status_change_on'} ) ) {
 		$last_status_change_on .= " " ;		# If we got the date, add a space to delimit what's coming up next
 	} else {
 		$last_status_change_on = "" ;		# If there's no date, init to null so we can add on
 	}
 
-	if ( defined( $html_url = $message->{'data'}->{'incident'}->{'html_url'} ) ) {
-		$comment = "Acknowledged via PagerDuty: " . $last_status_change_on . "<a href='" . $html_url . "' target='_new' >" . $html_url . " </a>" ;
+	# Set up a new custom default for the Comment. It may be modifed later depending on the incident type.
+	if ( defined( $html_url_incident = $message->{'data'}->{'incident'}->{'html_url'} ) ) {
+		$comment = "Acknowledged via PagerDuty: " . $last_status_change_on . "<a href='" . $html_url_incident . "' target='_new' >" . $html_url_incident . " </a>" ;
 	}
 	if ( defined( $assigned_to_user = $message->{'data'}->{'incident'}->{'assigned_to_user'} ) ) {
 		$comment .= " currently assigned to <a href='" . $assigned_to_user->{ 'html_url' } . "' target='_new' >" . $assigned_to_user->{ 'name' } . "</a> " . $assigned_to_user->{ 'email' } ;
@@ -249,10 +254,10 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 	if ($message->{'type'} eq 'incident.acknowledge') {
 
 		if ($hostservice->{'SERVICEDESC'} eq "") {
-			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, $author, $comment, 2, 0, 0);
+			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, $author, $comment, 2, 1, 0);
 
 		} else {
-			($status, $error) = ackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, $author, $comment, 2, 0, 0);
+			($status, $error) = ackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, $author, $comment, 2, 1, 0);
 		}
 
 		$return->{'messages'}{$message->{'id'}} = {
@@ -260,9 +265,17 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 			'message' => ($error ? $error : undef)
 		};
 
-	} elsif ($message->{'type'} eq 'incident.unacknowledge' || $message->{'type'} eq 'incident.assign' || $message->{'type'} eq 'incident.escalate' ) {
+	} elsif ($message->{'type'} eq 'incident.unacknowledge' || $message->{'type'} eq 'incident.assign' || $message->{'type'} eq 'incident.escalate' || $message->{'type'} eq 'incident.delegate' ) {
 
-		$comment =~ s/Acknowledged/Acknowledgement removed/ ;
+		if ( $message->{'type'} eq 'incident.unacknowledge' ) {
+			$comment =~ s/Acknowledged via/Acknowledgement removed due to timeout by/ ;
+		} elsif ( $message->{'type'} eq 'incident.assign' ) {
+			$comment =~ s/Acknowledged/Acknowledgement removed due to reassignment/ ;
+		} elsif ( $message->{'type'} eq 'incident.escalate' ) {
+			$comment =~ s/Acknowledged/Acknowledgement removed due to escalation/ ;
+		} elsif ( $message->{'type'} eq 'incident.delegate' ) {
+			$comment =~ s/Acknowledged/Acknowledgement removed due to delegation/ ;
+		}
 		
 		if (! defined ($hostservice->{'SERVICEDESC'})) {
 			($status, $error) = deackHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
@@ -277,26 +290,13 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 		};
 		$return->{'status'} = ($status eq 'okay' ? $return->{'status'} : 'fail');
 
-	} elsif ($message->{'type'} eq 'incident.resolve' ) {
+	} elsif ($message->{'type'} eq 'incident.resolve' || $message->{'type'} eq 'incident.trigger' ) {
 
-		$comment =~ s/Acknowledged/Resolved/ ;
-
-		if (! defined ($hostservice->{'SERVICEDESC'})) {
-			($status, $error) = commentHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
-
-		} else {
-			($status, $error) = commentService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 0, $author, $comment);
+		if ( $message->{'type'} eq 'incident.resolve' ) {
+			$comment =~ s/Acknowledged/Resolved/ ;
+		} elsif ( $message->{'type'} eq 'incident.trigger' ) {
+			$comment =~ s/Acknowledged via/Received by/ ;
 		}
-
-		$return->{'messages'}->{$message->{'id'}} = {
-			'status' => ($status ? 'okay' : 'fail'),
-			'message' => ($error ? $error : undef)
-		};
-		$return->{'status'} = ($status eq 'okay' ? $return->{'status'} : 'fail');
-
-	} elsif ($message->{'type'} eq 'incident.trigger' ) {
-
-		$comment =~ s/Acknowledged via/Received by/ ;
 
 		if (! defined ($hostservice->{'SERVICEDESC'})) {
 			($status, $error) = commentHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
