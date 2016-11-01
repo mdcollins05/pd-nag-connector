@@ -6,6 +6,7 @@ use strict;
 use CGI;
 use JSON;
 use LWP::UserAgent;
+use Net::DNS;
 
 # =============================================================================
 
@@ -18,12 +19,16 @@ my $CONFIG = {
 	'ack_ttl' => 0, # Time in seconds the acknowledgement in Icinga last before
 	                # it times out automatically. 0 means the acknowledgement
 	                # never expires. If you're using Nagios this MUST be 0.
+	#
+	# PagerDuty Webhook source, for validation of the incoming connection
+	# https://support.pagerduty.com/hc/en-us/articles/204923760
+	'webhook_hostname' => 'webhooks.pagerduty.com'
 };
 
 # =============================================================================
 
 sub ackHost {
-	my ($time, $host, $comment, $author, $sticky, $notify, $persistent) = @_;
+	my ($time, $host, $author, $comment, $sticky, $notify, $persistent) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -48,7 +53,7 @@ sub ackHost {
 # =============================================================================
 
 sub deackHost {
-	my ($time, $host) = @_;
+	my ($time, $host, $persistent, $author, $comment) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -57,6 +62,7 @@ sub deackHost {
 	}
 
 	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_HOST_COMMENT;%s;%u;%s;%s\n", $time, $host, $persistent, $author, $comment);
 	printf (NAGIOS "[%u] REMOVE_HOST_ACKNOWLEDGEMENT;%s\n", $time, $host);
 	# Close the file handle
 	close (NAGIOS);
@@ -68,7 +74,7 @@ sub deackHost {
 # =============================================================================
 
 sub ackService {
-	my ($time, $host, $service, $comment, $author, $sticky, $notify, $persistent) = @_;
+	my ($time, $host, $service, $author, $comment, $sticky, $notify, $persistent) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -94,7 +100,7 @@ sub ackService {
 # =============================================================================
 
 sub deackService {
-	my ($time, $host, $service) = @_;
+	my ($time, $host, $service, $persistent, $author, $comment) = @_;
 
 	# Open the external commands file
 	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
@@ -103,7 +109,48 @@ sub deackService {
 	}
 
 	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_SVC_COMMENT;%s;%s;%u;%s;%s\n", $time, $host, $service, $persistent, $author, $comment);
 	printf (NAGIOS "[%u] REMOVE_SVC_ACKNOWLEDGEMENT;%s;%s\n", $time, $host, $service);
+	# Close the file handle
+	close (NAGIOS);
+
+	# Return with happiness
+	return (1, undef);
+}
+
+# =============================================================================
+
+sub commentHost {
+	my ($time, $host, $persistent, $author, $comment) = @_;
+
+	# Open the external commands file
+	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
+		# Well shizzle
+		return (undef, $!);
+	}
+
+	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_HOST_COMMENT;%s;%u;%s;%s\n", $time, $host, $persistent, $author, $comment);
+	# Close the file handle
+	close (NAGIOS);
+
+	# Return with happiness
+	return (1, undef);
+}
+
+# =============================================================================
+
+sub commentService {
+	my ($time, $host, $service, $persistent, $author, $comment) = @_;
+
+	# Open the external commands file
+	if (! open (NAGIOS, '>>', $CONFIG->{'command_file'})) {
+		# Well shizzle
+		return (undef, $!);
+	}
+
+	# Success! Write the command
+	printf (NAGIOS "[%u] ADD_SVC_COMMENT;%s;%s;%u;%s;%s\n", $time, $host, $service, $persistent, $author, $comment);
 	# Close the file handle
 	close (NAGIOS);
 
@@ -116,6 +163,33 @@ sub deackService {
 my ($TIME, $QUERY, $POST, $JSON);
 
 $TIME = time ();
+
+my $REMOTE_ADDR = "";
+if ( exists $ENV{'REMOTE_ADDR'} ) {
+	if ( $ENV{'REMOTE_ADDR'} =~ m/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/ ) {
+		$REMOTE_ADDR = $1 ;
+	}
+}
+
+if ( $REMOTE_ADDR ) {	# If we didn't get any value at all, we'll still try processing the POST.
+	my $foundIt = 0 ;
+	my $res   = Net::DNS::Resolver->new ;
+	my $reply = $res->search( $CONFIG->{'webhook_hostname'} ) ;
+	if ( $reply ) {
+		foreach my $rr ( $reply->answer ) {
+			next unless $rr->type eq "A" ;
+			if ( $rr->address eq $REMOTE_ADDR ) {
+				$foundIt = 1 ;
+				last ;
+			}
+		}
+	}
+	if ( $foundIt != 1 ) {
+		print "Status: 403 Request from unauthorized IP address $REMOTE_ADDR\n\n403 Request from unauthorized IP address $REMOTE_ADDR\n" ;
+		exit( 0 ) ;
+	}
+}
+
 
 $QUERY = CGI->new ();
 
@@ -141,7 +215,9 @@ $return = {
 };
 
 MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
-	my ($hostservice, $status, $error);
+	my ($hostservice, $status, $error, $last_status_change_by, $pd_service, $assigned_to_user, $last_status_change_on, $html_url_incident );
+	my $author = 'PagerDuty System' ;
+	my $comment = 'Acknowledged via PagerDuty - no specific comment data available' ;
 
 	if ((ref ($message) ne 'HASH') || ! defined ($message->{'type'})) {
 		next MESSAGE;
@@ -153,12 +229,35 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 		next MESSAGE;
 	}
 
+	# If we get a "last changed by" object or a "service" object, use it to customize the Author
+	if ( defined( $last_status_change_by = $message->{'data'}->{'incident'}->{'last_status_change_by'} ) ) {
+		$author = "<a href='" . $last_status_change_by->{ 'html_url' } . "' target='_new' >" . $last_status_change_by->{ 'name' } . "</a> " . $last_status_change_by->{ 'email' } ;
+	} elsif ( defined( $pd_service = $message->{'data'}->{'incident'}->{'service'} ) ) {
+		$author = "<a href='" . $pd_service->{ 'html_url' } . "' target='_new' >" . $pd_service->{ 'name' } . "</a> " ;
+	}
+
+	# Did we get a last changed date?
+	if ( defined( $last_status_change_on = $message->{'data'}->{'incident'}->{'last_status_change_on'} ) ) {
+		$last_status_change_on .= " " ;		# If we got the date, add a space to delimit what's coming up next
+	} else {
+		$last_status_change_on = "" ;		# If there's no date, init to null so we can add on
+	}
+
+	# Set up a new custom default for the Comment. It may be modifed later depending on the incident type.
+	if ( defined( $html_url_incident = $message->{'data'}->{'incident'}->{'html_url'} ) ) {
+		$comment = "Acknowledged via PagerDuty: " . $last_status_change_on . "<a href='" . $html_url_incident . "' target='_new' >" . $html_url_incident . " </a>" ;
+	}
+	if ( defined( $assigned_to_user = $message->{'data'}->{'incident'}->{'assigned_to_user'} ) ) {
+		$comment .= " currently assigned to <a href='" . $assigned_to_user->{ 'html_url' } . "' target='_new' >" . $assigned_to_user->{ 'name' } . "</a> " . $assigned_to_user->{ 'email' } ;
+	}
+
 	if ($message->{'type'} eq 'incident.acknowledge') {
-                if ($hostservice->{'SERVICEDESC'} eq "") {
-			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, 'Acknowledged by PagerDuty', 'PagerDuty', 2, 0, 0);
+
+		if ($hostservice->{'SERVICEDESC'} eq "") {
+			($status, $error) = ackHost ($TIME, $hostservice->{'HOSTNAME'}, $author, $comment, 2, 1, 0);
 
 		} else {
-			($status, $error) = ackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 'Acknowledged by PagerDuty', 'PagerDuty', 2, 0, 0);
+			($status, $error) = ackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, $author, $comment, 2, 1, 0);
 		}
 
 		$return->{'messages'}{$message->{'id'}} = {
@@ -166,12 +265,44 @@ MESSAGE: foreach $message (@{$JSON->{'messages'}}) {
 			'message' => ($error ? $error : undef)
 		};
 
-	} elsif ($message->{'type'} eq 'incident.unacknowledge') {
+	} elsif ($message->{'type'} eq 'incident.unacknowledge' || $message->{'type'} eq 'incident.assign' || $message->{'type'} eq 'incident.escalate' || $message->{'type'} eq 'incident.delegate' ) {
+
+		if ( $message->{'type'} eq 'incident.unacknowledge' ) {
+			$comment =~ s/Acknowledged via/Acknowledgement removed due to timeout by/ ;
+		} elsif ( $message->{'type'} eq 'incident.assign' ) {
+			$comment =~ s/Acknowledged/Acknowledgement removed due to reassignment/ ;
+		} elsif ( $message->{'type'} eq 'incident.escalate' ) {
+			$comment =~ s/Acknowledged/Acknowledgement removed due to escalation/ ;
+		} elsif ( $message->{'type'} eq 'incident.delegate' ) {
+			$comment =~ s/Acknowledged/Acknowledgement removed due to delegation/ ;
+		}
+		
 		if (! defined ($hostservice->{'SERVICEDESC'})) {
-			($status, $error) = deackHost ($TIME, $hostservice->{'HOSTNAME'});
+			($status, $error) = deackHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
 
 		} else {
-			($status, $error) = deackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'});
+			($status, $error) = deackService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 0, $author, $comment );
+		}
+
+		$return->{'messages'}->{$message->{'id'}} = {
+			'status' => ($status ? 'okay' : 'fail'),
+			'message' => ($error ? $error : undef)
+		};
+		$return->{'status'} = ($status eq 'okay' ? $return->{'status'} : 'fail');
+
+	} elsif ($message->{'type'} eq 'incident.resolve' || $message->{'type'} eq 'incident.trigger' ) {
+
+		if ( $message->{'type'} eq 'incident.resolve' ) {
+			$comment =~ s/Acknowledged/Resolved/ ;
+		} elsif ( $message->{'type'} eq 'incident.trigger' ) {
+			$comment =~ s/Acknowledged via/Received by/ ;
+		}
+
+		if (! defined ($hostservice->{'SERVICEDESC'})) {
+			($status, $error) = commentHost ($TIME, $hostservice->{'HOSTNAME'}, 0, $author, $comment );
+
+		} else {
+			($status, $error) = commentService ($TIME, $hostservice->{'HOSTNAME'}, $hostservice->{'SERVICEDESC'}, 0, $author, $comment);
 		}
 
 		$return->{'messages'}->{$message->{'id'}} = {
